@@ -42,7 +42,7 @@
 #include "tls_session.h"
 #include "utils.h"
 
-#define DEBUG_SSL TRUE
+#define DEBUG_SSL FALSE
 
 #define RANDOM_SIZE 32
 #define MASTER_SECRET_SIZE 48
@@ -53,7 +53,7 @@
 #define CERTIFICATE_MAX_KEY_SIZE 68
 #define SIGNATURE_SIZE 256
 
-#define DEBUG_SSL TRUE
+#define DEBUG_SSL FALSE
 
 #define RANDOM_SIZE 32
 #define MASTER_SECRET_SIZE 48

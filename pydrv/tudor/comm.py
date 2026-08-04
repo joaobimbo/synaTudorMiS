@@ -5,9 +5,13 @@ import array
 import time
 import logging
 import threading
-import usb.core
-import usb.util
+try:
+    import usb.core
+    import usb.util
+except ModuleNotFoundError:  # Offline bundle/snapshot tooling needs no USB stack.
+    usb = None
 import tudor.tls
+from .safety import SafetyMode, SafetyPolicy, audit_record, log_audit
 from .log import *
 
 SUCCESS_STATUS = [0, 0x412, 0x5CC]
@@ -183,18 +187,22 @@ class CommunicationInterface:
 
 
 class USBCommunication(CommunicationInterface):
-    def __init__(self, dev):
+    def __init__(self, dev, policy: SafetyPolicy | None = None):
+        if usb is None:
+            raise RuntimeError("pyusb is required for sensor communication")
         self.dev = dev
-        self.dev.set_configuration()
-
-        # Detach kernel drivers
-        for i in range(self.dev.get_active_configuration().bNumInterfaces):
+        self.policy = policy or SafetyPolicy(SafetyMode.READ_ONLY)
+        try:
+            configuration = self.dev.get_active_configuration()
+        except usb.core.USBError as exc:
+            raise RuntimeError("sensor has no active USB configuration; refusing to configure it") from exc
+        for i in range(configuration.bNumInterfaces):
             if dev.is_kernel_driver_active(i):
-                dev.detach_kernel_driver(i)
+                raise RuntimeError(f"kernel driver owns USB interface {i}; refusing to detach it")
 
         # Claim the interface
         usb.util.claim_interface(dev, 0)
-        self.intf = self.dev.get_active_configuration()[(0, 0)]
+        self.intf = configuration[(0, 0)]
 
         # Find endpoints
         self.cmd_ep = self.intf[0]
@@ -214,22 +222,21 @@ class USBCommunication(CommunicationInterface):
 
     def close(self):
         usb.util.release_interface(self.dev, 0)
-        self.dev.reset()
         self.dev = None
 
     def reset(self):
-        self.tls_session = None
-        self.dev.reset()
+        self.policy.deny_usb_reset()
 
     def send_command(
         self, cmd, resp_size, timeout=2000, raw=False, check_response=True
     ):
+        self.policy.check_command(cmd, tls_active=self.tls_session is not None,
+                                  raw=raw)
+        log_audit(audit_record("request", cmd[0], cmd))
         # Wrap and send command
         Command.print(cmd[0])
 
         wcmd = self.tls_session.wrap(cmd) if self.tls_session is not None else cmd
-        print(f"--> first: {wcmd[0]}")
-        print(f"raw wreq: 0x{wcmd.hex()}")
         self.cmd_ep.write(wcmd, timeout)
 
         # Receive wrapped resonse
@@ -237,7 +244,6 @@ class USBCommunication(CommunicationInterface):
             resp_size += 0x45
         buf = array.array("B", [0 for _ in range(resp_size)])
         wresp = bytes(buf[: self.resp_ep.read(buf, timeout)])
-        print(f"raw wresp: 0x{wresp.hex()}")
 
         # Unwrap and parse response
         resp = self.tls_session.unwrap(wresp) if self.tls_session is not None else wresp
@@ -249,6 +255,9 @@ class USBCommunication(CommunicationInterface):
             Response.print(reply)
             if check_response and reply not in SUCCESS_STATUS:
                 raise CommandFailedException(struct.unpack("<H", resp[:2])[0])
+
+        status = struct.unpack("<H", resp[:2])[0] if not raw and len(resp) >= 2 else None
+        log_audit(audit_record("response", cmd[0], resp, status))
 
         return resp
 
@@ -262,7 +271,7 @@ class USBCommunication(CommunicationInterface):
         )
 
     def write_dft(self, data: bytes):
-        self.dev.ctrl_transfer(0x40, 0x15, 0, 0, data, 2000)
+        self.policy.deny_dft_write()
 
     def get_event_data(self) -> bytes:
         buf = array.array("B", [0 for _ in range(8)])
@@ -296,25 +305,25 @@ class LogCommunicationProxy(CommunicationInterface):
     ):
         Command.print(cmd[0])
         if raw:
-            logging.log(LOG_COMM, "-> RAW REQ     | 0x%s" % cmd.hex())
+            logging.log(LOG_COMM, "-> RAW REQ     | size=%d sha256=%s", len(cmd), __import__('hashlib').sha256(cmd).hexdigest())
             resp = self.proxied.send_command(
                 cmd, resp_size, timeout, raw, check_response
             )
-            logging.log(LOG_COMM, "<- RAW RESP    | 0x%s" % resp.hex())
+            logging.log(LOG_COMM, "<- RAW RESP    | size=%d sha256=%s", len(resp), __import__('hashlib').sha256(resp).hexdigest())
             return resp
         else:
             logging.log(
                 LOG_COMM,
-                "-> cmd 0x%02x      | %s"
-                % (struct.unpack("<B", cmd[:1])[0], cmd.hex()),
+                "-> cmd 0x%02x      | size=%d sha256=%s"
+                % (struct.unpack("<B", cmd[:1])[0], len(cmd), __import__('hashlib').sha256(cmd).hexdigest()),
             )
             resp = self.proxied.send_command(
                 cmd, resp_size, timeout, raw, check_response
             )
             logging.log(
                 LOG_COMM,
-                "<- status 0x%04x | %s"
-                % (struct.unpack("<H", resp[:2])[0], resp.hex()),
+                "<- status 0x%04x | size=%d sha256=%s"
+                % (struct.unpack("<H", resp[:2])[0], len(resp), __import__('hashlib').sha256(resp).hexdigest()),
             )
             return resp
 
@@ -336,11 +345,12 @@ class LogCommunicationProxy(CommunicationInterface):
         return status
 
     def write_dft(self, data: bytes):
-        logging.log(LOG_COMM, "-> DFT write: %s" % data.hex())
+        logging.log(LOG_COMM, "-> DFT write denied")
         self.proxied.write_dft(data)
 
     def get_event_data(self) -> bytes:
         logging.log(LOG_COMM, "-> get event data")
         data = self.proxied.get_event_data()
-        logging.log(LOG_COMM, "<- event data: %s" % data.hex())
+        logging.log(LOG_COMM, "<- event data: size=%d sha256=%s", len(data),
+                    __import__('hashlib').sha256(data).hexdigest())
         return data

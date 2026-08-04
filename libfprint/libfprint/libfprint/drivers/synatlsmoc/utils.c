@@ -253,23 +253,13 @@ cmd_to_str (guint8 cmd)
 gchar *
 bin2hex (const guint8 *arr, const gsize size)
 {
-  gchar *output;
-  guint char_idx = 0;
+  /* This helper is used only for diagnostic representations.  Returning a
+   * digest rather than raw hexadecimal prevents protocol payloads, biometric
+   * identifiers, certificates, and TLS material from entering logs. */
+  g_autoptr(GChecksum) checksum = g_checksum_new (G_CHECKSUM_SHA256);
 
-  output = g_malloc (3 + 2 * size);
-
-  output[char_idx++] = '0';
-  output[char_idx++] = 'x';
-
-  for (int arr_idx = 0; arr_idx < size; arr_idx++)
-    {
-      sprintf (&output[char_idx], "%02x", arr[arr_idx]);
-      char_idx += 2;
-    }
-
-  output[char_idx] = '\0';
-
-  return output;
+  g_checksum_update (checksum, arr, size);
+  return g_strdup_printf ("sha256:%s", g_checksum_get_string (checksum));
 }
 
 void

@@ -1,0 +1,22 @@
+diff --git a/meson.build b/meson.build
+index eebea25..b57fb74 100644
+--- a/meson.build
++++ b/meson.build
+@@ -165,6 +165,17 @@ endif
+ 
+ polkit_policy_directory = polkit_gobject_dep.get_variable('policydir')
++# A coexistence build under a non-system prefix must not overwrite the
++# distribution's D-Bus interfaces/configuration or polkit policy.  Stage all
++# integration data below the chosen prefix; activation is installed later as
++# an explicit, reversible gate.
++if get_option('prefix') != '/usr'
++    dbus_data_dir = datadir
++    dbus_conf_dir = datadir / 'dbus-1/system.d'
++    dbus_service_dir = datadir / 'dbus-1/system-services'
++    dbus_interfaces_dir = datadir / 'dbus-1/interfaces'
++    polkit_policy_directory = datadir / 'polkit-1/actions'
++endif
+ 
+ # Tests dependencies
+ pam_wrapper_dep = dependency('pam_wrapper', required: false)
+ if get_option('pam') and not pam_wrapper_dep.found()

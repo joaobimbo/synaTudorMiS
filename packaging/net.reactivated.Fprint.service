@@ -1,0 +1,6 @@
+# Replaces the distro activation file only during the reversible custom-fprintd gate.
+[D-BUS Service]
+Name=net.reactivated.Fprint
+Exec=/opt/synatlsmoc-coexist/libexec/fprintd
+User=root
+SystemdService=fprintd.service

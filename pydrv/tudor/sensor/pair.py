@@ -7,7 +7,6 @@ import cryptography.hazmat.primitives.asymmetric.ec as ecc
 import cryptography.hazmat.primitives.hashes as hashes
 import cryptography.hazmat.primitives.serialization as ser
 import cryptography.x509 as x509
-from .windows_pairing_data import PRIV_KEY, SENSOR_CERT, RECV_HOST_CERT
 
 
 # It's called that in the Windows driver
@@ -107,21 +106,6 @@ class SensorPairingData:
 
         # Load sensor certificate
         sensor_cert = SensorCertificate.frombytes(bio.read(400))
-
-        return SensorPairingData(priv_key, host_cert, sensor_cert)
-
-    @staticmethod
-    def load_windows_sample() -> SensorPairingData:
-
-        priv_key = ecc.derive_private_key(
-            int.from_bytes(PRIV_KEY, "little"), ecc.SECP256R1()
-        )
-
-        # Load host certificate
-        host_cert = SensorCertificate.frombytes(RECV_HOST_CERT)
-
-        # Load sensor certificate
-        sensor_cert = SensorCertificate.frombytes(SENSOR_CERT)
 
         return SensorPairingData(priv_key, host_cert, sensor_cert)
 

@@ -34,7 +34,7 @@ class CmdDB2GetObjectList(Command):
             obj_id = ID_ZERO
             print(f"No object_id given, using {obj_id}")
         else:
-            obj_id = eval(args[1])
+            obj_id = parse_hex_bytes(args[1], length=16)
 
         obj_type = int(args[0])
         ctx.sensor.get_object_list(obj_type, obj_id)
@@ -52,7 +52,7 @@ class CmdDB2GetObjectInfo(Command):
 
         obj_type = int(args[0])
         # TODO: find a better way to  convert
-        obj_id = eval(args[1])
+        obj_id = parse_hex_bytes(args[1], length=16)
         print(ctx.sensor.get_object_info(obj_type, obj_id))
 
 
@@ -69,7 +69,7 @@ class CmdDB2GetAllObjectInfo(Command):
         if len(args) <= 1:
             obj_id = ID_ZERO
         else:
-            obj_id = eval(args[1])
+            obj_id = parse_hex_bytes(args[1], length=16)
 
         obj_type = int(args[0])
         ctx.sensor.get_all_object_info(obj_type, obj_id)
@@ -87,7 +87,7 @@ class CmdDB2GetObjectData(Command):
 
         obj_type = int(args[0])
         # TODO: find a better way to  convert
-        obj_id = eval(args[1])
+        obj_id = parse_hex_bytes(args[1], length=16)
         print(ctx.sensor.get_object_data(obj_type, obj_id))
 
 
@@ -104,7 +104,7 @@ class CmdDB2GetAllObjectData(Command):
         if len(args) <= 1:
             obj_id = ID_ZERO
         else:
-            obj_id = eval(args[1])
+            obj_id = parse_hex_bytes(args[1], length=16)
 
         obj_type = int(args[0])
         ctx.sensor.get_all_object_data(obj_type, obj_id)
@@ -121,7 +121,7 @@ class CmdDB2DeleteObject(Command):
             raise Exception("No obj_type or obj_id")
 
         obj_type = int(args[0])
-        obj_id = eval(args[1])
+        obj_id = parse_hex_bytes(args[1], length=16)
         ctx.sensor.db2_delete_object(obj_type, obj_id)
 
 
@@ -155,7 +155,7 @@ class CmdDeleteEnrollment(Command):
         if len(args) <= 0:
             raise Exception("No tuid")
 
-        tuid = eval(args[0])
+        tuid = parse_hex_bytes(args[0], length=16)
         ctx.sensor.delete_enrollment(tuid)
 
 

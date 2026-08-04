@@ -22,7 +22,9 @@ class CmdGpioWrite(Command):
     def run(self, ctx: CmdContext, args: list):
         if len(args) <= 0:
             raise Exception("No state specified!")
-        state = eval(args[0])
+        normalized = args[0].strip().lower()
+        if normalized not in ("true", "false"):
+            raise ValueError("state must be true or false")
+        state = normalized == "true"
 
         ctx.sensor.gpio_write(state)
-

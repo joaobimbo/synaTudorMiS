@@ -7,3 +7,20 @@
 **/builddir
 **/compile_commands.json
 **/.cache
+
+# Local builds and fetched upstream source
+/build-opt/
+/build-fprintd/
+/fprintd-1.94.5/
+/pydrv/.venv/
+
+# Per-device pairing material and hardware transcripts (never package/commit)
+/HostPartitionExportV1.json
+/PairingBundleV1.json
+/pairing-data
+/probe.json
+/template-list.json
+/snapshot-*.json
+/windows/PairingBundleV1.json
+/windows/tudor-00c9-driver-metadata.json
+/TudorFinalWindowsExport*.zip

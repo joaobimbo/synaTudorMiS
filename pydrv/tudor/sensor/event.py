@@ -36,9 +36,9 @@ class SensorEventHandler:
         self.num_pending = 0
         self.event_queue = []
 
-        # Init event mask
+        # Construction is side-effect free. Verification configures the mask
+        # immediately before capture; opening/listing must not write one.
         self.event_mask = []
-        self.set_event_mask([])
 
     # NOTE If the event condition is already satisfied, this will immediatly triger a event
     def set_event_mask(self, events: list):

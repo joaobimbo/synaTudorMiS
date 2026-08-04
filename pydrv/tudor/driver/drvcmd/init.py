@@ -7,9 +7,7 @@ class CmdInit(Command):
     """Initializes the sensor"""
 
     def run(self, ctx: CmdContext, _):
-        if ctx.sensor.initialized:
-            raise Exception("Sensor is already initialized!")
-        ctx.sensor.initialize(ctx.pairing_data)
+        raise RuntimeError("legacy interactive initialization is disabled; use tudor-safe with PairingBundleV1")
 
 
 @cmd("uninit")

@@ -38,7 +38,7 @@ class CmdVerify(Command):
         if len(args) < 1:
             raise Exception("No tuid list given")
 
-        tuid = eval(args[0])
+        tuid = parse_hex_bytes(args[0], length=16)
 
         # Wait for finger to be lifted
         print("Waiting for finger to be lifted...")
@@ -47,7 +47,8 @@ class CmdVerify(Command):
         )
 
 
-        ctx.sensor.auth(tuid)
+        print("\aTouch the sensor with the selected finger.", flush=True)
+        ctx.sensor.auth([tuid])
 
 @cmd("identify")
 class CmdIdentify(Command):

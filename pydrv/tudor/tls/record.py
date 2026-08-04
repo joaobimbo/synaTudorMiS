@@ -63,13 +63,13 @@ class TlsRecordLayer:
                 # Handle fragment content
                 if ptext.content_type == data.TlsChangeCipherSpec.content_type:
                     msg = data.TlsChangeCipherSpec.read(fstream)
-                    logging.log(tudor.LOG_TLS, "<- %r" % msg)
+                    logging.log(tudor.LOG_TLS, "<- TLS change-cipher-spec")
 
                     # Switch encryption algorithms
                     self.remote_encryption_algo = self.encryption_algo
                 elif ptext.content_type == data.TlsAlert.content_type:
                     alert = data.TlsAlert.read(fstream)
-                    logging.log(tudor.LOG_TLS, "<- %r" % alert)
+                    logging.log(tudor.LOG_TLS, "<- TLS alert type=%s", alert.descr)
 
                     # Handle the alert
                     if alert.descr == data.TlsAlertDescription.CLOSE_NOTIFY:
@@ -89,13 +89,15 @@ class TlsRecordLayer:
                         raise data.TlsAlertException(alert.descr, True)
                 elif ptext.content_type == data.TlsHandshakeMessage.content_type:
                     msg = data.TlsHandshakeMessage.read(fstream)
-                    logging.log(tudor.LOG_TLS, "<- %r" % msg)
+                    logging.log(tudor.LOG_TLS, "<- TLS handshake type=%s",
+                                type(msg).__name__)
 
                     # Proxy to handshake protocol
                     self.session.handshake_proto.receive(msg)
                 elif ptext.content_type == data.TlsApplicationData.content_type:
                     msg = data.TlsApplicationData.read(fstream)
-                    logging.log(tudor.LOG_TLS, "<- %r" % msg)
+                    logging.log(tudor.LOG_TLS, "<- TLS application data size=%d",
+                                len(msg.data))
 
                     # Add to buffer
                     self.application_data.write(msg.data)
@@ -104,7 +106,9 @@ class TlsRecordLayer:
 
     def send(self, content: data.TlsDataInstance):
         assert not self.send_closed
-        logging.log(tudor.LOG_TLS, "-> %r" % content)
+        size = len(content.data) if isinstance(content, data.TlsApplicationData) else None
+        logging.log(tudor.LOG_TLS, "-> TLS content type=%s%s", type(content).__name__,
+                    " size=%d" % size if size is not None else "")
 
         # If we write a different message type, flush content buffer
         if (

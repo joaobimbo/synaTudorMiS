@@ -40,7 +40,6 @@
 #include "fpi-log.h"
 #include "fpi-ssm.h"
 #include "fpi-usb-transfer.h"
-#include "sample_pairing_data.h"
 #include "sensor_public_keys.h"
 #include "synatlsmoc.h"
 #include "tagval.h"
@@ -51,12 +50,6 @@
 /* WARN: this driver may not work (cannot test it), if the sensor is not once
  * initialized in Windows */
 /* WARN: current implementation starts a new TLS session on each device open */
-
-#define DEBUG
-
-/* Needed for testing with libfprint examples they do not support storage of
- * pairing data */
-// #define USE_SAMPLE_PAIRING_DATA
 
 guint8 cache_tuid[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -106,7 +99,7 @@ G_DEFINE_TYPE (FpiDeviceSynaTlsMoc, fpi_device_synatlsmoc, FP_TYPE_DEVICE);
 // clang-format off
 static const FpIdEntry id_table[] = {
     /* the sensors commented out are untested, but should be suported */
-    // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00C9, },
+    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00C9, },
     // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D1, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D8, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00E7, },
@@ -117,6 +110,46 @@ static const FpIdEntry id_table[] = {
     { .vid = 0, .pid = 0, .driver_data = 0 }, /* terminating entry */
 };
 // clang-format on
+
+static void
+synatlsmoc_probe (FpDevice *device)
+{
+  GUsbDevice *usb = fpi_device_get_usb_device (device);
+  g_autofree gchar *serial = NULL;
+  g_autofree gchar *device_id = NULL;
+  g_autoptr (GError) error = NULL;
+
+  if (!g_usb_device_open (usb, &error))
+    {
+      fpi_device_probe_complete (device, NULL, NULL,
+                                 g_steal_pointer (&error));
+      return;
+    }
+
+  if (g_usb_device_get_serial_number_index (usb) != 0)
+    serial = g_usb_device_get_string_descriptor (
+        usb, g_usb_device_get_serial_number_index (usb), &error);
+
+  g_usb_device_close (usb, NULL);
+  if (error)
+    {
+      fpi_device_probe_complete (device, NULL, NULL,
+                                 g_steal_pointer (&error));
+      return;
+    }
+  if (serial == NULL || *serial == '\0')
+    {
+      fpi_device_probe_complete (
+          device, NULL, NULL,
+          fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                    "USB serial is required for stable coexistence identity"));
+      return;
+    }
+
+  device_id = g_strdup_printf ("%04x-%04x-%s", g_usb_device_get_vid (usb),
+                               g_usb_device_get_pid (usb), serial);
+  fpi_device_probe_complete (device, device_id, NULL, NULL);
+}
 
 static gboolean
 synatlsmoc_is_in_bootloader_mode (FpiDeviceSynaTlsMoc *self)
@@ -559,6 +592,50 @@ synatlsmoc_cmd_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
 
 /* NOTE: buffer_in in callback is automatically freed when callback returns
  */
+static gboolean
+coexist_command_allowed (gboolean raw, const guint8 *cmd, gsize cmd_size)
+{
+  guint32 template_bytes = 0;
+
+  /* Raw transfers are TLS records produced by tls_session_flush_send_buffer;
+   * all sensor plaintext commands pass through the switch below before TLS
+   * wrapping. */
+  if (cmd_size == 0)
+    return FALSE;
+  if (raw)
+    return (cmd[0] >= 0x14 && cmd[0] <= 0x17) ||
+           (cmd_size >= 5 && cmd[0] == VCSFW_CMD_TLS_DATA &&
+            cmd[4] >= 0x14 && cmd[4] <= 0x17);
+
+  switch (cmd[0])
+    {
+    case VCSFW_CMD_GET_VERSION:
+    case VCSFW_CMD_GET_STARTINFO:
+    case VCSFW_CMD_STORAGE_INFO_GET:
+    case VCSFW_CMD_STORAGE_PART_READ:
+    case VCSFW_CMD_FRAME_READ:
+    case VCSFW_CMD_FRAME_ACQ:
+    case VCSFW_CMD_FRAME_FINISH:
+    case VCSFW_CMD_FRAME_STATE_GET:
+    case VCSFW_CMD_EVENT_CONFIG:
+    case VCSFW_CMD_EVENT_READ:
+    case VCSFW_CMD_IOTA_FIND:
+    case VCSFW_CMD_DB2_GET_DB_INFO:
+    case VCSFW_CMD_DB2_GET_OBJECT_LIST:
+    case VCSFW_CMD_DB2_GET_OBJECT_INFO:
+    case VCSFW_CMD_DB2_GET_OBJECT_DATA:
+    case VCSFW_CMD_GET_IMAGE_METRICS:
+      return TRUE;
+    case VCSFW_CMD_IDENTIFY_MATCH:
+      if (cmd_size != 29)
+        return FALSE;
+      memcpy (&template_bytes, cmd + 5, sizeof (template_bytes));
+      return GUINT32_FROM_LE (template_bytes) == sizeof (Db2Id);
+    default:
+      return FALSE;
+    }
+}
+
 static void
 synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw, gboolean check_res, guint8 *cmd, gsize cmd_size, gsize resp_size, CmdCallback callback)
 {
@@ -568,16 +645,18 @@ synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw, gboolean check_res
   GError *local_error = NULL;
   guint8 *wrapped;
   gsize wrapped_len;
-#ifdef DEBUG
-  g_autofree char *wrapped_str = NULL;
-  g_autofree char *cmd_str = bin2hex (cmd, cmd_size);
-#endif
 
   g_assert (cmd);
+  if (!coexist_command_allowed (raw, cmd, cmd_size))
+    {
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                "Command 0x%02x denied by coexistence policy",
+                                cmd_size ? cmd[0] : 0));
+      return;
+    }
   fp_dbg ("CMD  -> 0x%02x - %s", cmd[0], cmd_to_str (cmd[0]));
-#ifdef DEBUG
-  fp_dbg ("\traw req: %s", cmd_str);
-#endif
 
   g_assert (self->cmd_ssm == NULL);
   self->cmd_ssm = fpi_ssm_new_full (device, synatlsmoc_cmd_run_state, CMD_STATES,
@@ -605,10 +684,6 @@ synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw, gboolean check_res
 
       data->length_in = resp_size + WRAP_RESPONSE_ADDITIONAL_SIZE;
 
-#ifdef DEBUG
-      wrapped_str = bin2hex (wrapped, wrapped_len);
-      fp_dbg ("\traw wreq: %s", wrapped_str);
-#endif
     }
   else
     {
@@ -640,12 +715,12 @@ synatlsmoc_set_print_data (FpPrint *print, Db2Id template_id, FpUserId fp_user_i
 
   g_object_set (print, "description", user_id_safe, NULL);
 
-  GVariant *uid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, user_id_safe,
-                                             sizeof (FpUserId), 1);
   GVariant *tid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, template_id,
                                              sizeof (Db2Id), 1);
 
-  GVariant *fpi_data = g_variant_new ("(y@ay@ay)", finger_id, tid, uid);
+  /* Windows SID/user data are display metadata only.  Compatibility and
+   * authorization are restricted to the sensor finger subtype and template. */
+  GVariant *fpi_data = g_variant_new ("(y@ay)", finger_id, tid);
   g_object_set (print, "fpi-data", fpi_data, NULL);
 }
 
@@ -2825,22 +2900,13 @@ reset_usb_device_on_callback (FpiUsbTransfer *transfer,
 static void
 write_dft (FpiDeviceSynaTlsMoc *self, const guint8 *data, const gsize data_size, FpiUsbTransferCallback callback)
 {
-  g_autofree char *data_str = bin2hex (data, data_size);
-  fp_dbg ("DFT -> %s", data_str);
-
-  /* Send data */
-  g_autoptr (FpiUsbTransfer) transfer = fpi_usb_transfer_new (FP_DEVICE (self));
-  fpi_usb_transfer_fill_control (transfer, G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
-                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
-                                 G_USB_DEVICE_RECIPIENT_DEVICE,
-                                 REQUEST_DFT_WRITE, 0, 0, data_size);
-
-  transfer->short_is_error = FALSE;
-  transfer->ssm = self->task_ssm;
-  memcpy (transfer->buffer, data, data_size);
-
-  fpi_usb_transfer_submit (transfer, SYNATLSMOC_USB_CONTROL_TIMEOUT, NULL,
-                           callback, NULL);
+  (void) data;
+  (void) data_size;
+  (void) callback;
+  fpi_ssm_mark_failed (
+      self->task_ssm,
+      set_and_report_error (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                            "DFT/control writes are permanently disabled"));
 }
 
 /**
@@ -2879,76 +2945,6 @@ send_bootloader_mode_enter_exit (FpiDeviceSynaTlsMoc *self,
 }
 
 /* end of communication function =========================================== */
-
-static void
-synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
-{
-  GError *local_error = NULL;
-
-  guint8 *privkey_pem;
-  gsize privkey_pem_len;
-
-  guint8 *client_cert_raw = sample_recv_host_cert;
-  gsize client_cert_len = CERTIFICATE_SIZE;
-
-  guint8 *server_cert_raw = sample_sensor_cert;
-  gsize server_cert_len = CERTIFICATE_SIZE;
-
-  privkey_pem = sample_privkey_pem;
-  privkey_pem_len = sizeof (sample_privkey_pem);
-
-#ifdef DEBUG
-  g_autofree gchar *client_cert_str = bin2hex (client_cert_raw, client_cert_len);
-  g_autofree gchar *server_cert_str = bin2hex (server_cert_raw, server_cert_len);
-  fp_dbg ("Loading sample pairing data:");
-  fp_dbg ("\thost cert: %s", client_cert_str);
-  fp_dbg ("\tsensor cert: %s", server_cert_str);
-  fp_dbg ("\tprivate key:\n\n%.*s", (int) privkey_pem_len, privkey_pem);
-#endif
-
-  g_autoptr (OSSL_DECODER_CTX) dctx = OSSL_DECODER_CTX_new_for_pkey (
-      &self->pairing_data.client_key, "PEM", NULL, "EC",
-      OSSL_KEYMGMT_SELECT_KEYPAIR | OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS, NULL,
-      NULL);
-
-  if (dctx == NULL ||
-      OSSL_DECODER_from_data (dctx, (const guint8 **) &privkey_pem,
-                              &privkey_pem_len) <= 0)
-    g_assert_not_reached ();
-
-  self->pairing_data.client_cert_raw =
-      g_memdup2 (client_cert_raw, client_cert_len);
-  self->pairing_data.client_cert_len = client_cert_len;
-
-  self->pairing_data.server_cert_raw =
-      g_memdup2 (server_cert_raw, server_cert_len);
-  self->pairing_data.server_cert_len = server_cert_len;
-
-  if (!sensor_certificate_from_raw (&self->pairing_data.client_cert,
-                                    client_cert_raw, client_cert_len,
-                                    &local_error))
-    {
-      fpi_ssm_mark_failed (self->task_ssm, set_and_report_error (
-                                               FP_DEVICE_ERROR_PROTO,
-                                               "Cannot parse host certificate: %s",
-                                               local_error->message));
-      g_error_free (local_error);
-      return;
-    }
-
-  if (!sensor_certificate_from_raw (&self->pairing_data.server_cert,
-                                    server_cert_raw, server_cert_len,
-                                    &local_error))
-    {
-      fpi_ssm_mark_failed (
-          self->task_ssm,
-          set_and_report_error (FP_DEVICE_ERROR_PROTO,
-                                "Cannot parse sensor certificate: %s",
-                                local_error->message));
-      g_error_free (local_error);
-      return;
-    }
-}
 
 static void
 synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
@@ -3079,22 +3075,19 @@ store_pairing_data (FpiDeviceSynaTlsMoc *self)
 
   GVariant *privkey_pem_var = g_variant_new_string (privkey_pem);
 
-  GVariant *pairing_data = g_variant_new ("(@ay@ay@s)", client_cert_var,
-                                          server_cert_var, privkey_pem_var);
+  GVariantBuilder builder;
+  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
+  g_variant_builder_add (&builder, "{sv}", "format",
+                         g_variant_new_string ("PairingDataV1"));
+  g_variant_builder_add (&builder, "{sv}", "host-certificate",
+                         client_cert_var);
+  g_variant_builder_add (&builder, "{sv}", "sensor-certificate",
+                         server_cert_var);
+  g_variant_builder_add (&builder, "{sv}", "host-private-key-pem",
+                         privkey_pem_var);
+  GVariant *pairing_data = g_variant_builder_end (&builder);
 
   g_object_set (FP_DEVICE (self), "fpi-persistent-data", pairing_data, NULL);
-
-#ifdef DEBUG
-  g_autofree char *client_cert_str =
-      bin2hex (client_cert_raw_cpy, CERTIFICATE_SIZE);
-  g_autofree char *server_cert_str =
-      bin2hex (server_cert_raw_cpy, CERTIFICATE_SIZE);
-
-  fp_dbg ("Successfully stored pairing data:");
-  fp_dbg ("\tClient certificate: %s", client_cert_str);
-  fp_dbg ("\tServer certificate: %s", server_cert_str);
-  fp_dbg ("\tPEM private key:\n%s", privkey_pem);
-#endif
 
   fpi_ssm_next_state (self->task_ssm);
 }
@@ -3103,10 +3096,6 @@ static void
 load_pairing_data (FpiDeviceSynaTlsMoc *self)
 {
   GError *local_error = NULL;
-
-#ifdef DEBUG
-  fp_dbg ("Loading pairing data form persistent storage:");
-#endif
 
   g_autoptr (GVariant) pairing_data = NULL;
   g_autoptr (GVariant) client_cert_var = NULL;
@@ -3124,7 +3113,7 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
       return;
     }
 
-  if (!g_variant_check_format_string (pairing_data, "(@ay@ay@s)", FALSE))
+  if (!g_variant_is_of_type (pairing_data, G_VARIANT_TYPE_VARDICT))
     {
       fpi_ssm_mark_failed (
           self->task_ssm,
@@ -3133,8 +3122,22 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
       return;
     }
 
-  g_variant_get (pairing_data, "(@ay@ay@s)", &client_cert_var, &server_cert_var,
-                 &privkey_pem_var);
+  g_autofree gchar *format = NULL;
+  if (!g_variant_lookup (pairing_data, "format", "s", &format) ||
+      g_strcmp0 (format, "PairingDataV1") != 0 ||
+      !g_variant_lookup (pairing_data, "host-certificate", "@ay",
+                         &client_cert_var) ||
+      !g_variant_lookup (pairing_data, "sensor-certificate", "@ay",
+                         &server_cert_var) ||
+      !g_variant_lookup (pairing_data, "host-private-key-pem", "@s",
+                         &privkey_pem_var))
+    {
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (FP_DEVICE_ERROR_GENERAL,
+                                "PairingDataV1 is incomplete or invalid"));
+      return;
+    }
 
   gsize client_cert_data_size = 0;
   guint8 *client_cert_data = (guint8 *) g_variant_get_fixed_array (
@@ -3153,12 +3156,6 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
       g_memdup2 (client_cert_data, CERTIFICATE_SIZE);
   self->pairing_data.client_cert_len = CERTIFICATE_SIZE;
 
-#ifdef DEBUG
-  g_autofree char *client_cert_str =
-      bin2hex (self->pairing_data.client_cert_raw, CERTIFICATE_SIZE);
-  fp_dbg ("\tClient certificate: %s", client_cert_str);
-#endif
-
   gsize server_cert_data_size = 0;
   guint8 *server_cert_data = (guint8 *) g_variant_get_fixed_array (
       server_cert_var, &server_cert_data_size, 1);
@@ -3176,20 +3173,10 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
       g_memdup2 (server_cert_data, CERTIFICATE_SIZE);
   self->pairing_data.server_cert_len = CERTIFICATE_SIZE;
 
-#ifdef DEBUG
-  g_autofree char *server_cert_str =
-      bin2hex (self->pairing_data.server_cert_raw, CERTIFICATE_SIZE);
-  fp_dbg ("\tServer certificate: %s", server_cert_str);
-#endif
-
   gsize privkey_pem_size = 0;
   // fIXME: autofree
   const gchar *privkey_pem =
       g_variant_get_string (privkey_pem_var, &privkey_pem_size);
-
-#ifdef DEBUG
-  fp_dbg ("\tPEM private key:\n%s", privkey_pem);
-#endif
 
   g_autoptr (OSSL_DECODER_CTX) dctx = OSSL_DECODER_CTX_new_for_pkey (
       &self->pairing_data.client_key, "PEM", NULL, "EC",
@@ -3228,51 +3215,8 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
 }
 
 static void
-pair (FpiDeviceSynaTlsMoc *self)
-{
-  if (!synatlsmoc_is_provisioned (self))
-    {
-      fp_warn ("Skipping pairing: sensor is already paired or insecure");
-      return;
-    }
-
-  if (!synatlsmoc_has_advanced_security (self))
-    {
-      fp_warn (
-          "Skipping pairing: only advanced security is supported (per "
-          "Windows driver)");
-      fpi_ssm_next_state (self->task_ssm);
-      return;
-    }
-
-  fp_dbg ("Pairing sensor");
-
-  self->pairing_data.client_key = EVP_EC_gen ("prime256v1");
-
-  /* we create it already serialized, as we do not need it in struct form */
-  GError *error = NULL;
-  g_autofree guint8 *host_certificate_raw = NULL;
-  if (!create_host_certificate (self->pairing_data.client_key,
-                                &host_certificate_raw, &error))
-    {
-      fpi_ssm_mark_failed (self->task_ssm, error);
-      return;
-    }
-
-  /* saves received certificates to self */
-  send_pair (self, host_certificate_raw);
-}
-
-static void
 fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
 {
-#ifdef USE_SAMPLE_PAIRING_DATA
-  fp_warn (
-      "Using sample pairing data, you should not see this during normal use");
-  synatlsmoc_load_sample_pairing_data (self);
-  /* skip over pairing states */
-  fpi_ssm_jump_to_state (self->task_ssm, OPEN_VERIFY_SENSOR_CERTIFICATE);
-#else
   g_autoptr (GVariant) pairing_data = NULL;
   g_object_get (FP_DEVICE (self), "fpi-persistent-data", &pairing_data, NULL);
 
@@ -3283,8 +3227,11 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
       if (!synatlsmoc_is_provisioned (self))
         fp_warn ("Sensor is not provisioned");
 
-      fp_warn ("Need to pair sensor");
-      fpi_ssm_next_state (self->task_ssm); /* OPEN_SEND_PAIR */
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                "Pre-imported Windows pairing data are required; "
+                                "automatic pairing is disabled"));
     }
   else
     {
@@ -3292,7 +3239,6 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
       /* skip over pairing states */
       fpi_ssm_jump_to_state (self->task_ssm, OPEN_VERIFY_SENSOR_CERTIFICATE);
     }
-#endif
 }
 
 static void
@@ -3314,7 +3260,6 @@ static void
 synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
-  OpenData *open_ssm_data = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -3332,8 +3277,10 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       else if (self->session == NULL && self->server_established)
         {
-          fp_warn ("Sensor is in TLS session but host is not");
-          fpi_ssm_next_state (ssm);
+          fpi_ssm_mark_failed (
+              ssm, set_and_report_error (FP_DEVICE_ERROR_BUSY,
+                                         "Sensor has a stale remote TLS session; "
+                                         "forced recovery is disabled"));
         }
       else if (self->session != NULL && self->server_established)
         {
@@ -3346,8 +3293,9 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       break;
     case OPEN_FORCE_TLS_CLOSE:
-      g_assert (self->server_established);
-      send_cmd_to_force_close_sensor_tls_session (self);
+      fpi_ssm_mark_failed (
+          ssm, set_and_report_error (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                     "Forced TLS close is disabled"));
       break;
     case OPEN_GET_VERSION:
       send_get_version (self);
@@ -3355,18 +3303,10 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
     case OPEN_EXIT_BOOTLOADER:
       if (synatlsmoc_is_in_bootloader_mode (self))
         {
-          if (open_ssm_data->tried_to_exit_bootloader_mode)
-            {
-              fpi_ssm_mark_failed (ssm, set_and_report_error (
-                                            FP_DEVICE_ERROR_NOT_SUPPORTED,
-                                            "Sensor doesn't have a valid firmware, "
-                                            "need to update to a valid one first!"));
-            }
-          else
-            {
-              open_ssm_data->tried_to_exit_bootloader_mode = TRUE;
-              send_bootloader_mode_enter_exit (self, BOOTLOADER_MODE_EXIT);
-            }
+          fpi_ssm_mark_failed (
+              ssm, set_and_report_error (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                         "Sensor is in bootloader mode; automatic "
+                                         "transition is disabled"));
         }
       else
         {
@@ -3393,7 +3333,9 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
     case OPEN_SEND_PAIR:
       {
-        pair (self);
+        fpi_ssm_mark_failed (
+            ssm, set_and_report_error (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                       "PAIR is disabled by coexistence policy"));
         break;
       }
     case OPEN_SAVE_PAIRING_DATA:
@@ -3440,7 +3382,7 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
       }
     case OPEN_SET_EVENT_MASK:
       {
-        send_event_config (self, NO_EVENTS);
+        fpi_ssm_mark_completed (ssm);
         break;
       }
     }
@@ -3454,12 +3396,6 @@ synatlsmoc_open (FpDevice *device)
   GError *error = NULL;
 
   self->interrupt_cancellable = g_cancellable_new ();
-
-  if (!g_usb_device_reset (fpi_device_get_usb_device (device), &error))
-    {
-      fpi_device_open_complete (device, error);
-      return;
-    }
 
   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device), 0, 0,
                                      &error))
@@ -3548,15 +3484,14 @@ close_tls_session (FpiDeviceSynaTlsMoc *self)
 static void
 synatlsmoc_close_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 {
-  GError *error = NULL;
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case CLOSE_EVENT_MASK_NONE:
-      send_event_config (self, NO_EVENTS);
-      if (error)
-        fpi_ssm_mark_failed (ssm, error);
+      /* Event-mask writes are not needed for close.  Advance directly to the
+       * ordinary TLS close-notify state. */
+      fpi_ssm_next_state (ssm);
       break;
     case CLOSE_TLS_SESSION_CLOSE:
       if (self->session)
@@ -3605,14 +3540,8 @@ synatlsmoc_list_run_state (FpiSsm *ssm, FpDevice *device)
       }
     case LIST_DB2_CLEANUP:
       {
-        if (data->cleanup_required)
-          {
-            send_db2_cleanup (self);
-          }
-        else
-          {
-            fpi_ssm_next_state (ssm);
-          }
+        /* Listing must never mutate DB2, even if tombstones are present. */
+        fpi_ssm_next_state (ssm);
         break;
       }
 
@@ -3706,7 +3635,6 @@ get_template_id_from_fp_print (FpPrint *print, Db2Id template_id, GError **error
   gboolean ret = TRUE;
 
   g_autoptr (GVariant) fpi_data = NULL;
-  g_autoptr (GVariant) fp_user_id_var = NULL;
   g_autoptr (GVariant) tid_var = NULL;
   const guint8 *tid = NULL;
 
@@ -3714,7 +3642,7 @@ get_template_id_from_fp_print (FpPrint *print, Db2Id template_id, GError **error
 
   g_object_get (print, "fpi-data", &fpi_data, NULL);
 
-  if (!g_variant_check_format_string (fpi_data, "(y@ay@ay)", FALSE))
+  if (!g_variant_check_format_string (fpi_data, "(y@ay)", FALSE))
     {
       *error = set_and_report_error (FP_DEVICE_ERROR_DATA_INVALID,
                                      "Print data has invalid fpi-data format");
@@ -3723,7 +3651,7 @@ get_template_id_from_fp_print (FpPrint *print, Db2Id template_id, GError **error
     }
 
   FingerId finger_id = 0;
-  g_variant_get (fpi_data, "(y@ay@ay)", finger_id, &tid_var, &fp_user_id_var);
+  g_variant_get (fpi_data, "(y@ay)", &finger_id, &tid_var);
 
   gsize tid_len = 0;
   tid = g_variant_get_fixed_array (tid_var, &tid_len, 1);
@@ -4039,20 +3967,20 @@ fpi_device_synatlsmoc_class_init (FpiDeviceSynaTlsMocClass *klass)
 
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
-  dev_class->nr_enroll_stages = SYNATLSMOC_ENROLL_STAGES;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->temp_hot_seconds = -1;
 
   dev_class->open = synatlsmoc_open;
+  dev_class->probe = synatlsmoc_probe;
   dev_class->close = synatlsmoc_close;
-  dev_class->enroll = synatlsmoc_enroll;
   dev_class->verify = synatlsmoc_identify_verify;
-  dev_class->identify = synatlsmoc_identify_verify;
   dev_class->list = synatlsmoc_list;
-  dev_class->delete = synatlsmoc_delete;
-  dev_class->clear_storage = synatlsmoc_clear_storage;
   dev_class->cancel = synatlsmoc_cancel;
   dev_class->suspend = synatlsmoc_suspend;
 
   fpi_device_class_auto_initialize_features (dev_class);
+  /* libfprint gates list_prints on the umbrella STORAGE bit.  The generic
+   * feature inference only sets it when a delete callback also exists, but
+   * coexistence deliberately exposes read-only listing without deletion. */
+  dev_class->features |= FP_DEVICE_FEATURE_STORAGE;
 }

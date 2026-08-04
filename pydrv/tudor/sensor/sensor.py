@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import hashlib
 import logging
 import pathlib
 import struct
@@ -14,7 +15,6 @@ from .iota import *
 from .pair import *
 from .sensor import *
 from .event import *
-from .windows_pairing_data import WINBIO_SAMPLE_SID
 from .bmkt import *
 
 # per vfmUtilAuthImageQuality
@@ -130,18 +130,8 @@ class Sensor:
         self.initialized = False
         self.host_partition = tudor.win.HashTagValContainer()
 
-        # Initial reset of the sensor
-        self.reset()
-
-        # If we're in bootloader mode, exit it
-        if self.in_bootloader_mode():
-            logging.log(tudor.LOG_INFO, "Sensor is in bootloader mode, exiting it...")
-            self.bootloader.exit_bootloader_mode()
-            if self.in_bootloader_mode():
-                logging.log(
-                    tudor.LOG_WARN,
-                    "Sensor doesn't have a valid firmware, need to update to a valid one first!",
-                )
+        # Construction is deliberately side-effect free.  Safe callers must
+        # explicitly probe state; bootloader mode is a refusal condition.
 
     def reset(self):
         # Uninitialize sensor
@@ -152,6 +142,11 @@ class Sensor:
 
         # Reset the sensor
         self.comm.reset()
+
+        self.read_state()
+
+    def read_state(self, *, include_diagnostic_iotas: bool = True):
+        """Read sensor state without reset, recovery, or persistence writes."""
 
         # Get the sensor state
         state_data = self.comm.send_command(
@@ -175,29 +170,36 @@ class Sensor:
         self.prov_state = SensorProvisionState(prov_state & 0xF)
 
         if not self.in_bootloader_mode():
-            # Read config version & some other IOTAs
-            self.cfg_ver = ConfigVersionIOTA.read_from_comm(self.comm)
-            self.ipl_iota = IplIOTA.read_from_comm(self.comm)
-            self.iota_2e = PackedIOTA.read_from_comm(self.comm, 0x2E)
-            self.wbf_param_iota = WbfParamIOTA.read_from_comm(self.comm)
-
-            # Load the sensor key
+            # Load the sensor key needed for certificate verification.
             self.pub_key = load_sensor_key(self.fw_major, self.fw_minor, self.key_flag)
+            if include_diagnostic_iotas:
+                # Legacy diagnostics only. Their layouts vary by firmware and
+                # they are not inputs to identity validation, TLS, DB2, or
+                # matching, so the safe production open path omits them.
+                self.cfg_ver = ConfigVersionIOTA.read_from_comm(self.comm)
+                self.ipl_iota = IplIOTA.read_from_comm(self.comm)
+                self.iota_2e = PackedIOTA.read_from_comm(self.comm, 0x2E)
+                self.wbf_param_iota = WbfParamIOTA.read_from_comm(self.comm)
 
-    def initialize(self, pairing_data: SensorPairingData):
+    def initialize(self, pairing_data: SensorPairingData, *, expected_private_identity: bytes):
         assert not self.initialized
 
-        # Reset the sensor
-        self.reset()
+        if self.comm.remote_tls_status():
+            raise RuntimeError("sensor has a stale remote TLS session; forced close is forbidden")
+        self.read_state(include_diagnostic_iotas=False)
 
         logging.log(tudor.LOG_INFO, "Initializing sensor...")
 
-        # We mustn't be in bootloader mode
-        assert not self.in_bootloader_mode()
+        if self.in_bootloader_mode():
+            raise RuntimeError("sensor is in bootloader mode; recovery is forbidden")
+        if not self.is_paired() or not self.advanced_security:
+            raise RuntimeError("sensor is not provisioned with advanced security")
+        if self.id != expected_private_identity:
+            raise RuntimeError("private sensor identity mismatch; refusing pairing reuse")
 
         # Log sensor info
         logging.log(tudor.LOG_DETAIL, "Sensor info:")
-        logging.log(tudor.LOG_DETAIL, "    ID: %s" % self.id.hex())
+        logging.log(tudor.LOG_DETAIL, "    private identity: [redacted]")
         logging.log(
             tudor.LOG_DETAIL,
             "    FW version: %d.%d.%d"
@@ -214,15 +216,6 @@ class Sensor:
         )
         logging.log(tudor.LOG_DETAIL, "    product id: %s" % self.product_id)
         logging.log(tudor.LOG_DETAIL, "    provision state: %s" % self.prov_state)
-        logging.log(
-            tudor.LOG_DETAIL,
-            "    config version: %d.%d.%d"
-            % (self.cfg_ver.major, self.cfg_ver.minor, self.cfg_ver.revision),
-        )
-        logging.log(
-            tudor.LOG_DETAIL, "    WBF parameter: 0x%x" % self.wbf_param_iota.param
-        )
-
         # Read and log start info
         start_data = self.comm.send_command(
             struct.pack("<B", tudor.Command.GET_START_INFO), 0x44
@@ -243,44 +236,46 @@ class Sensor:
                 % (i, struct.unpack("<I", reset_nvinfo[4 * i : 4 * i + 4])[0]),
             )
 
-        if self.is_paired():
-            if pairing_data is None:
-                raise Exception("No pairing data given")
+        if pairing_data is None:
+            raise RuntimeError("pre-imported Windows pairing data are required")
+        self.pub_key.verify(
+            pairing_data.sensor_cert.signature,
+            pairing_data.sensor_cert.signbytes(),
+            ecc.ECDSA(hashes.SHA256()),
+        )
+        if pairing_data.priv_key.public_key().public_numbers() != pairing_data.host_cert.pub_key.public_numbers():
+            raise RuntimeError("pairing private key does not match host certificate")
 
-            # Verify sensor certificate
-            self.pub_key.verify(
-                pairing_data.sensor_cert.signature,
-                pairing_data.sensor_cert.signbytes(),
-                ecc.ECDSA(hashes.SHA256()),
-            )
-
-            # Establish session
-            self.tls_session = tudor.tls.TlsSession(
-                self.comm,
-                tudor.tls.TlsEccRemoteKey(
-                    pairing_data.priv_key,
-                    pairing_data.host_cert,
-                    pairing_data.sensor_cert,
-                ),
-            )
-            self.tls_session.establish()
-            self.comm.set_tls_session(self.tls_session)
-        else:
-            logging.log(
-                tudor.LOG_INFO,
-                "Sensor is unprovisioned, not establishing TLS session...",
-            )
-
-        # Get frame dimensions
-        (dim_data,) = struct.unpack(
-            "<14x18s2x",
-            self.comm.send_command(
-                struct.pack("<HxxxxxBB", tudor.Command.FRAME_STATE_GET, 2, 7), 0x22
+        self.tls_session = tudor.tls.TlsSession(
+            self.comm,
+            tudor.tls.TlsEccRemoteKey(
+                pairing_data.priv_key,
+                pairing_data.host_cert,
+                pairing_data.sensor_cert,
             ),
         )
-
-        # Create event handler
-        self.event_handler = tudor.sensor.SensorEventHandler(self)
+        self.tls_session.establish()
+        self.comm.set_tls_session(self.tls_session)
+        try:
+            # Confirm the volatile frame interface is readable. No event mask
+            # is configured during open.
+            struct.unpack(
+                "<14x18s2x",
+                self.comm.send_command(
+                    struct.pack("<HxxxxxBB", tudor.Command.FRAME_STATE_GET, 2, 7),
+                    0x22,
+                ),
+            )
+            self.event_handler = tudor.sensor.SensorEventHandler(self)
+        except Exception:
+            # An authenticated partial open must not leave a remote session.
+            # Only the normal TLS close-notify is allowed; no reset/recovery.
+            self.comm.set_tls_session(None)
+            try:
+                self.tls_session.close()
+            finally:
+                self.tls_session = None
+            raise
 
         logging.log(tudor.LOG_INFO, "Sucessfully initialized sensor")
         self.initialized = True
@@ -353,8 +348,6 @@ class Sensor:
         return self
 
     def __exit__(self, t, v, tb):
-        if self.in_bootloader_mode():
-            self.bootloader.exit_bootloader_mode()
         if self.initialized:
             self.uninitialize()
 
@@ -449,10 +442,9 @@ class Sensor:
             f"\tprovision_state: {provision_state}\n"
         )
 
-    def auth(
-        self, tuid_list: list[bytes] = [], user_id=WINBIO_SAMPLE_SID, sub_id=None
-    ) -> bool:
-        # TODO: fix WINBIO_SAMPLE_SID
+    def auth(self, tuid_list: list[bytes], user_id=None, sub_id=None) -> bool:
+        if len(tuid_list) != 1 or len(tuid_list[0]) != 16:
+            raise ValueError("verification requires exactly one 16-byte template ID")
         self.capture_image(capture_flags=7)
         _, image_quality = self.mis_get_auth_image_metrics(
             MIS_IMAGE_METRICS_IMG_QUALITY
@@ -485,13 +477,10 @@ class Sensor:
         if sub_id is not None and sub_id != match_sub_id:
             return False
 
-        logging.info("Matched:")
-        logging.info(f"\ttemplate UID: {match_tuid.hex()}")
-        logging.info(f"\tuser ID: {match_user_id.hex()}")
-        logging.info(f"\tsub ID: {match_sub_id.hex()}")
+        logging.info("Matched the single selected template (identifiers redacted)")
         return True
 
-    def enroll(self, user_id=WINBIO_SAMPLE_SID, sub_id=b"\xf7"):
+    def enroll(self, user_id=None, sub_id=b"\xf7"):
         logging.log(
             tudor.LOG_PROTO,
             "Starting enroll process... (does not check for identical fingerprints)",
@@ -609,7 +598,6 @@ class Sensor:
             1,
             0,
         )
-        print(f"msg: {msg}")
         for _ in range(NO_RETRIES):
             resp = self.comm.send_command(
                 msg,
@@ -769,7 +757,6 @@ class Sensor:
             for tuid in tuid_list:
                 msg += tuid
 
-        print(f"sending msg with len: {len(msg)} and data: {msg.hex()}")
         assert len(msg) == SEND_LEN
 
         resp = self.comm.send_command(msg, RECV_LEN, check_response=False)
@@ -810,7 +797,6 @@ class Sensor:
             # I did not see this situation so no idea how to parse
             raise NotImplementedError
 
-        print(recv_data_y)
         to_deserialize = tudor.win.WinTagValContainer.frombytes(recv_data_z)
         match_tuid = to_deserialize[ENROLL_TAG_TUID]
         match_user_id = to_deserialize[ENROLL_TAG_USERID]
@@ -1052,7 +1038,7 @@ class Sensor:
             start_offset = 2 + 16 * i
             id_data = id_list[start_offset : start_offset + 16]
             id_list_parsed.append(id_data)
-            logging.info(f"\tat idx {i} is: {id_data}")
+            logging.info("object %d hash=%s", i, hashlib.sha256(id_data).hexdigest())
         return id_list_parsed
 
     def get_object_info(self, obj_type: int, obj_id: bytes) -> bytes:
@@ -1075,21 +1061,14 @@ class Sensor:
         obj_info = resp[2:]
 
         if obj_type == 1:
-            print(f"\t0-1: {obj_info[0:2]}")
+            logging.debug("user object info received (%d bytes)", len(obj_info))
             (smt1,) = struct.unpack("<I", obj_info[2 : 2 + 4])
-            print(f"\t2-5: {smt1}")
             (smt2,) = struct.unpack("<B", obj_info[2:3])
-            print(f"\t2: {smt2}")
-            print(f"\t6-10: {obj_info[6:10]}")
 
         elif obj_type in (2, 3):
             (smt1,) = struct.unpack("<H", obj_info[2 : 2 + 2])
-            print(f"\t0-1: {obj_info[0:2]}")
-            print(f"\t2-17 likely tuid: {obj_info[2:18]}")
-            print(f"\t18-33 smt. that matches user_id: {obj_info[18:18+16]}")
-            print(f"\t34-49 - some user prop. id: {obj_info[34:]}")
+            logging.debug("template/payload object info received (%d bytes)", len(obj_info))
             (obj_data_size,) = struct.unpack("<I", obj_info[46 : 46 + 4])
-            print(f"\t46-49: size of object data: {obj_data_size}")
 
         return obj_info
 
@@ -1122,8 +1101,6 @@ class Sensor:
         assert len(msg) == SEND_LEN
 
         resp = self.comm.send_command(msg, recv_len)
-        print(resp)
-
         (obj_data_len,) = struct.unpack("<I", resp[4 : 4 + 4])
         obj_data = resp[8:]
         assert len(obj_data) == obj_data_len
@@ -1275,14 +1252,13 @@ class Sensor:
         for tuid in tuid_list:
             payload_id_list = self.get_object_list(OBJ_TYPE_PAYLOADS, tuid)
             if len(payload_id_list) == 0:
-                logging.info(f"No payload data for an enrollment with tuid: {tuid}")
+                logging.info("No payload data for template hash=%s", hashlib.sha256(tuid).hexdigest())
                 continue
 
             for payload_id in payload_id_list:
                 obj_data = self.get_object_data(OBJ_TYPE_PAYLOADS, payload_id)
-                logging.debug(
-                    f"tuid: {tuid}, payload_id: {payload_id} has obj_data: {obj_data}"
-                )
+                logging.debug("payload received: size=%d sha256=%s", len(obj_data),
+                              hashlib.sha256(obj_data).hexdigest())
                 if len(obj_data) == 0:
                     continue
 

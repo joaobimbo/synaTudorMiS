@@ -27,24 +27,6 @@ class CmdLoadPairdata(Command):
         print("Successfully loaded pairing data")
 
 
-@cmd("load_sample_pdata")
-class CmdLoadPairdata(Command):
-    """
-    Loads Windows sample pairing data from WinDbg capture
-    Usage: load_sample_pdata
-    """
-
-    def run(self, ctx: CmdContext, args: list):
-        if ctx.pairing_data is not None:
-            resp = input("Do you want to override existing pairing data (y/n): ")
-            resp = resp.strip().lower()
-            if resp != "y":
-                return
-
-        ctx.pairing_data = tudor.sensor.SensorPairingData.load_windows_sample()
-        print("Successfully loaded sample pairing data")
-
-
 @cmd("save_pdata")
 class CmdSavePairdata(Command):
     """
