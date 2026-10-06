@@ -6,6 +6,22 @@ enrollment. This is likely the reason why the current libfprint library does not
 work with this sensor. The goal is to create a prototype driver. If you have any
 questions/additions, feel free to reach out/open an issue/merge request.
 
+### Experimental 06CB:00C9 Windows/Linux coexistence
+
+The `dual-boot-hello` work reuses a pre-imported Windows pairing and an
+existing on-sensor template for Linux verification. On one `06CB:00C9` unit,
+standalone verification, isolated fprintd, PAM authentication, and Windows
+Hello have worked without a detected change to the pre-authentication sensor
+snapshot. This is not yet a generally installable solution; see the
+[complete procedure](docs/coexistence-complete-procedure.md),
+[safety rules](docs/06cb-00c9-coexistence-safety.md), and [remaining work](TODO.md).
+
+Windows Restart has left this unit with a volatile TLS session that Linux
+refuses to force-close. For Windows-to-Linux transitions, run
+`shutdown.exe /s /t 0` in Windows, wait about 30 seconds after power-off, then
+boot Linux. A full power-off cleared the stale session in the observed test;
+it is not a proven fix for every reboot or capture failure.
+
 ### Building
 
 For building use a
@@ -43,14 +59,15 @@ writing tests.
 
 ### What works:
 
-- Everything should work (though there may be bugs).
+- The original driver paths remain experimental. The `06CB:00C9` coexistence
+  result and its limits are described above.
 
 ### What does not work:
 
-- Using the same pairing data/fingerprints in Windows and Linux.
-  - This would require an equivalent function to Crypt(Un)ProtectData to encrypt
-    the pairing data before writing to host partition on sensor. Or dumping the
-    pairing data and storing them on Linux as well.
+- General, automatic reuse of Windows pairing data and fingerprints across
+  supported sensors. The experimental `06CB:00C9` path above requires a
+  separately exported and validated pairing bundle, a local claim for exactly
+  one existing template, and the documented shutdown procedure.
 
 ### To-dos:
 

@@ -604,7 +604,7 @@ class Sensor:
                 RECEIVED_SIZE,
                 check_response=False,
             )
-            reply = struct.unpack("<H", resp)
+            (reply,) = struct.unpack("<H", resp)
 
             if reply == STATUS_SMT_LIKE_PROCESSING:
                 logging.log(
@@ -614,7 +614,9 @@ class Sensor:
             else:
                 break
 
-        return reply in STATUS_SUCCESS
+        if reply not in STATUS_SUCCESS:
+            raise tudor.CommandFailedException(reply)
+        return True
 
     def send_frame_finish(self):
         logging.log(tudor.LOG_COMM, "Sending frame finish")

@@ -359,6 +359,16 @@ the sensor loses power. The exact safe transition is:
 2. Wait approximately 30 seconds after the machine powers off.
 3. Power on and boot Linux.
 
+Microsoft documents `shutdown.exe /s /t 0` as a full shutdown; the optional
+`/hybrid` switch requests Fast Startup instead. Do not use the Windows Restart
+menu item as a substitute for powering off. In the 2026-10-06 test on firmware
+`10.1.3399660`, Windows Restart led to a stale remote TLS refusal. After a
+subsequent full power-off and roughly 30 seconds off, the existing Linux claim
+returned `verify-match`; the post-match pre-authentication snapshot matched
+the baseline exactly. The experiment does not establish that every full
+shutdown removes sensor power or that every `0x05cb` capture response has the
+same cause. See the [Microsoft shutdown documentation](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/fast-startup-causes-system-hibernation-shutdown-fail).
+
 For Linux to Windows, keep the custom no-timeout fprintd service under systemd
 control and use a normal orderly shutdown. Its tested stop path closes TLS.
 Never kill fprintd or remove `--no-timeout` before switching operating systems.
@@ -373,6 +383,10 @@ sudo poweroff
 sudo systemctl unmask fprintd.service
 sudo systemctl start fprintd.service
 ```
+
+The mask survives reboot until the `unmask` command is run. Keep password
+authentication available during this recovery; restoring the fingerprint prompt
+does not by itself prove the stale session is gone.
 
 Stop immediately if Windows Hello fails, any snapshot field changes, or a
 power cycle does not clear the volatile session. Do not reset or force-close

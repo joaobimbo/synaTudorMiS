@@ -5,6 +5,24 @@ pairing, an existing Windows template, standalone libfprint, isolated fprintd,
 PAM authentication, password fallback, and unchanged pre-authentication
 snapshots. Windows Hello continued to work after the Linux tests.
 
+## Capture failure and power-cycle result (2026-10-06)
+
+On firmware `10.1.3399660`, the isolated fprintd and standalone Python verify
+both establish the imported pairing but receive status `0x05cb` from
+`VCSFW_CMD_FRAME_ACQ` (`0x80`) before capture. The old "generic
+VCS_RESULT_SENSOR_MALFUNCTIONED" message is a fallback for unknown statuses;
+the reverse-engineering notes map `0x05cb` to an unnamed vendor result `0x0dd`.
+The cause of `0x05cb` is not yet known. The Python frame-acquire path now raises
+the numeric status instead of waiting forever for a finger event. A post-failure
+read-only snapshot matched `snapshot-before.json`, and no stale remote TLS was
+reported then. A subsequent Windows Restart into Linux reported stale remote
+TLS. After a full power-off and roughly 30 seconds off, the isolated fprintd
+verified the existing finger successfully; the post-match pre-authentication
+snapshot was byte-for-byte identical to the baseline. This demonstrates
+recovery for this cycle, not a general fix for the capture or reboot lifecycle.
+Do not reset, force-close TLS, re-pair, or change sensor persistence to work
+around these statuses.
+
 The following work remains before treating this as a generally installable
 solution.
 
