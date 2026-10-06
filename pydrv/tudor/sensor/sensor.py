@@ -254,9 +254,9 @@ class Sensor:
                 pairing_data.sensor_cert,
             ),
         )
-        self.tls_session.establish()
-        self.comm.set_tls_session(self.tls_session)
         try:
+            self.tls_session.establish()
+            self.comm.set_tls_session(self.tls_session)
             # Confirm the volatile frame interface is readable. No event mask
             # is configured during open.
             struct.unpack(
@@ -270,10 +270,9 @@ class Sensor:
         except Exception:
             # An authenticated partial open must not leave a remote session.
             # Only the normal TLS close-notify is allowed; no reset/recovery.
-            self.comm.set_tls_session(None)
-            try:
-                self.tls_session.close()
-            finally:
+            if self.tls_session.established:
+                self._close_tls_session()
+            else:
                 self.tls_session = None
             raise
 
@@ -287,17 +286,21 @@ class Sensor:
         # TODO Stop frame capturer
 
         # Stop event handler
-        if self.event_handler.event_mask != []:
-            self.event_handler.set_event_mask([])
-        self.event_handler = None
-
-        # Close TLS session
-        if self.tls_session != None:
-            self.comm.set_tls_session(None)
-            self.tls_session.close()
-            self.tls_session = None
+        try:
+            if self.event_handler is not None and self.event_handler.event_mask != []:
+                self.event_handler.set_event_mask([])
+        finally:
+            self.event_handler = None
+            self._close_tls_session()
 
         self.initialized = False
+
+    def _close_tls_session(self):
+        if self.tls_session is None:
+            return
+        self.comm.set_tls_session(None)
+        self.tls_session.close()
+        self.tls_session = None
 
     def in_bootloader_mode(self):
         return self.product_id in (

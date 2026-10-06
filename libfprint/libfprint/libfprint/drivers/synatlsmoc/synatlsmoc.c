@@ -83,6 +83,8 @@ struct _FpiDeviceSynaTlsMoc
   /* NOTE: host/this driver is the client, sensor is server */
   TlsSession *session;
   gboolean server_established;
+  gboolean tls_data_sent;
+  gboolean stale_close_attempted;
 
   guint16 event_seq_num;
   guint32 event_mask;
@@ -916,8 +918,8 @@ send_cmd_to_force_close_sensor_tls_session (
     FpiDeviceSynaTlsMoc *self)
 {
   const guint send_size = 1;
-  /* we may get a TLS alert message, so increase the recv_size accordingly */
-  const guint expected_recv_size = 38 + WRAP_RESPONSE_ADDITIONAL_SIZE;
+  /* A stale TLS session may return an alert as well as command status. */
+  const guint expected_recv_size = 256;
 
   guint8 cmd_buf[send_size];
   cmd_buf[0] = VCSFW_CMD_GET_VERSION;
@@ -3241,14 +3243,66 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
     }
 }
 
+static void synatlsmoc_close_ssm_run_state (FpiSsm *ssm, FpDevice *dev);
+
+static void
+synatlsmoc_open_cleanup_done (FpiSsm *ssm, FpDevice *device, GError *error)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+  GError *open_error = fpi_ssm_get_data (ssm);
+  GError *release_error = NULL;
+  GError *result_error = g_error_copy (open_error);
+
+  if (error)
+    {
+      g_prefix_error (&result_error, "TLS cleanup failed (%s); ",
+                      error->message);
+      g_error_free (error);
+    }
+
+  if (self->session)
+    tls_session_free (self->session);
+  self->session = NULL;
+  self->tls_data_sent = FALSE;
+  g_usb_device_release_interface (fpi_device_get_usb_device (device), 0, 0,
+                                  &release_error);
+  if (release_error)
+    {
+      g_prefix_error (&result_error, "USB release failed (%s); ",
+                      release_error->message);
+      g_error_free (release_error);
+    }
+
+  self->task_ssm = NULL;
+  fpi_device_open_complete (device, result_error);
+}
+
 static void
 synatlsmoc_open_done (FpiSsm *ssm, FpDevice *device, GError *error)
 {
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
   if (error)
     {
+      self->task_ssm = NULL;
+      if (self->session && self->tls_data_sent)
+        {
+          self->task_ssm = fpi_ssm_new_full (
+              device, synatlsmoc_close_ssm_run_state, CLOSE_NUM_STATES,
+              CLOSE_NUM_STATES, "Failed open TLS cleanup");
+          fpi_ssm_set_data (self->task_ssm, error,
+                            (GDestroyNotify) g_error_free);
+          fpi_ssm_start (self->task_ssm, synatlsmoc_open_cleanup_done);
+          return;
+        }
+
+      if (self->session)
+        tls_session_free (self->session);
+      self->session = NULL;
+      self->tls_data_sent = FALSE;
       g_usb_device_release_interface (fpi_device_get_usb_device (device), 0, 0,
                                       NULL);
-      synatlsmoc_task_ssm_done (ssm, device, error);
+      fpi_device_open_complete (device, error);
       return;
     }
 
@@ -3277,10 +3331,21 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       else if (self->session == NULL && self->server_established)
         {
-          fpi_ssm_mark_failed (
-              ssm, set_and_report_error (FP_DEVICE_ERROR_BUSY,
-                                         "Sensor has a stale remote TLS session; "
-                                         "forced recovery is disabled"));
+          if (!self->stale_close_attempted &&
+              g_usb_device_get_pid (fpi_device_get_usb_device (dev)) == 0x00c9)
+            {
+              /* One attempt only. The next status query must show TLS clear
+               * before any handshake can begin. */
+              self->stale_close_attempted = TRUE;
+              fpi_ssm_jump_to_state (ssm, OPEN_FORCE_TLS_CLOSE);
+            }
+          else
+            {
+              fpi_ssm_mark_failed (
+                  ssm, set_and_report_error (
+                           FP_DEVICE_ERROR_BUSY,
+                           "Sensor has a stale remote TLS session"));
+            }
         }
       else if (self->session != NULL && self->server_established)
         {
@@ -3293,9 +3358,7 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       break;
     case OPEN_FORCE_TLS_CLOSE:
-      fpi_ssm_mark_failed (
-          ssm, set_and_report_error (FP_DEVICE_ERROR_NOT_SUPPORTED,
-                                     "Forced TLS close is disabled"));
+      send_cmd_to_force_close_sensor_tls_session (self);
       break;
     case OPEN_GET_VERSION:
       send_get_version (self);
@@ -3377,6 +3440,7 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
             break;
           }
 
+        self->tls_data_sent = TRUE;
         send_tls_data (self, tls_data, tls_data_len);
         break;
       }
@@ -3396,6 +3460,7 @@ synatlsmoc_open (FpDevice *device)
   GError *error = NULL;
 
   self->interrupt_cancellable = g_cancellable_new ();
+  self->stale_close_attempted = FALSE;
 
   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device), 0, 0,
                                      &error))
@@ -3437,19 +3502,58 @@ static void
 synatlsmoc_close_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
+  GError *release_error = NULL;
 
-  tls_session_free (self->session);
+  if (self->session)
+    tls_session_free (self->session);
   self->session = NULL;
+  self->tls_data_sent = FALSE;
 
   // FIXME: causes errors
   // free_pairing_data(&self->pairing_data);
 
-  g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
+  g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0,
+                                  &release_error);
+  if (error)
+    g_clear_error (&release_error);
+  else
+    error = release_error;
 
   synatlsmoc_task_ssm_done (ssm, dev, error);
 
   if (!error)
     fpi_device_close_complete (dev, NULL);
+}
+
+static void
+recv_close_tls_data (FpDevice *device, guchar *buffer_in, gsize length_in,
+                     GError *error)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+
+  if (!tls_session_receive_ciphertext (self->session, buffer_in, length_in,
+                                       &error))
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+
+  if (tls_session_has_data (self->session))
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+                           fpi_device_error_new_msg (
+                               FP_DEVICE_ERROR_PROTO,
+                               "Unexpected TLS data after close-notify"));
+      return;
+    }
+
+  fpi_ssm_next_state (self->task_ssm);
 }
 
 static void
@@ -3476,9 +3580,8 @@ close_tls_session (FpiDeviceSynaTlsMoc *self)
       return;
     }
 
-  // FIXME: callback was made for open only (why was this here if it works?)
   synatlsmoc_exec_cmd (self, TRUE, FALSE, tls_data, tls_size, expected_recv_size,
-                       recv_tls_data);
+                       recv_close_tls_data);
 }
 
 static void
@@ -3498,6 +3601,22 @@ synatlsmoc_close_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
         {
           close_tls_session (self);
         }
+      else
+        {
+          fpi_ssm_mark_completed (ssm);
+        }
+      break;
+    case CLOSE_TLS_STATUS:
+      synatlsmoc_get_tls_status (self, ssm);
+      break;
+    case CLOSE_CHECK_TLS_STATUS:
+      if (self->server_established)
+        fpi_ssm_mark_failed (ssm,
+                             fpi_device_error_new_msg (
+                                 FP_DEVICE_ERROR_PROTO,
+                                 "Sensor still reports TLS after close-notify"));
+      else
+        fpi_ssm_mark_completed (ssm);
       break;
     }
 }

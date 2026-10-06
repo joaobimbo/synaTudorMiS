@@ -27,9 +27,10 @@ Windows.
 Read `docs/06cb-00c9-coexistence-safety.md` before any hardware work. Keep the
 stable public USB-serial identity and reuse only the pre-imported Windows
 pairing and the single existing template. Never automatically pair, enroll,
-reset sensor/USB, clear or write persistence, force-close a foreign TLS session,
-or start the Tudor host launcher. A stale remote session with no matching
-host-owned session remains a **hard refusal**. Keep password login available.
+reset sensor/USB, clear or write persistence, make repeated/unrestricted
+force-close attempts, or start the Tudor host launcher. The default 06cb:00c9
+path is limited to one GET_VERSION close attempt and a mandatory status check;
+if TLS remains active, it is a **hard refusal**. Keep password login available.
 Keep experimental services masked except during a separately approved test.
 Show each exact sensor-facing command and get explicit approval before running
 it; ring the terminal bell immediately before an approved finger touch. Compare
@@ -63,13 +64,57 @@ SIDs, template IDs, snapshots, or raw biometric/protocol payloads.
    until a verified replacement exists.
 5. Add hardware-independent lifecycle tests (recorded transcripts or fakes)
    for successful close, partial-open failure, cancellation, and close errors.
-   Assert no reset/force-close/persistent-write command is emitted. Then run
+   Assert no reset/repeated-close/persistent-write command is emitted. Then run
    the existing release check and Meson tests.
 6. With separate approval per gate, validate on 06cb:00c9: Linux verify and
    orderly stop/reboot, then alternating Windows/Linux boots. Recheck Windows
    Hello and the baseline snapshot. If Windows leaves a foreign TLS session,
    retain the safe refusal and document the power-off procedure; do not
    disguise that limitation as a Linux software fix.
+
+## Code progress (2026-10-06)
+
+- The C close state machine now advances without a local session, handles its
+  own close response, and checks the read-only remote TLS status before it
+  reports a successful close. Failed opens that sent handshake data attempt
+  ordinary close-notify before releasing USB.
+- Python closes an established session after failed initialization or event
+  cleanup, and checks remote TLS status after close-notify. Authenticated
+  command callers release the USB transport even if cleanup raises.
+- Hardware-independent Python lifecycle tests pass. The isolated C driver
+  builds and the available Meson tests pass. These tests do not prove daemon
+  stop, suspend, or Linux reboot on the device; the hardware observations below
+  cover one Windows warm-restart recovery cycle.
+- Windows-origin stale TLS after **Restart** was a hard refusal before the
+  single approved experiment below. The default driver now makes one
+  `GET_VERSION` close attempt on 06cb:00c9, then requires remote TLS to clear
+  before proceeding. Full shutdown remains the fallback if it fails.
+
+## One approved Windows Restart recovery experiment (2026-10-06)
+
+- Windows Hello worked before Windows Restart. The isolated fprintd reported a
+  stale remote TLS session on the following Linux boot.
+- The fingerprint reader was on a root-hub port whose descriptor advertises no
+  per-port power switching. One approved USB reset left remote TLS active.
+- A separately approved, single plaintext `GET_VERSION` (`0x01`) returned
+  `0x0315` and cleared remote TLS. A fresh read-only probe succeeded, and the
+  pre-authentication snapshot matched the saved baseline in every field.
+- The first approved fprintd touch returned no match; a separately approved
+  second touch returned `verify-match`. The post-match snapshot still matched.
+- The next Windows Restart was recovered by the installed default driver; Linux
+  fingerprint login and subsequent Windows Hello both succeeded, and the
+  persistence snapshot remained unchanged. This is one validated cycle on
+  firmware `10.1.3399660`. Do not infer that USB reset or port disable removes
+  power.
+- The default build was installed into the isolated `/opt/synatlsmoc-coexist`
+  libfprint location, and fprintd restarted successfully. The previous library
+  is backed up under `/opt/synatlsmoc-coexist/rollback-stale-recovery/`.
+  The installed library hash matched the tested build.
+- GDM fingerprint login is configured for five tries within 60 seconds. The
+  password PAM service skips its one-try fingerprint module from `common-auth`,
+  leaving the dedicated fingerprint worker to own sensor retries. A failed
+  scan followed by a second touch logged in successfully; password login still
+  works.
 
 ## Starting points and completion criteria
 

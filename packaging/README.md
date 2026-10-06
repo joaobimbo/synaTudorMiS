@@ -88,10 +88,23 @@ therefore owned by systemd, and the service must be stopped normally before an
 OS switch.
 
 The tested Windows driver may retain its volatile TLS session across a warm
-restart. Windows-to-Linux transitions therefore require a complete shutdown
-and roughly 30 seconds powered off. This is a documented runtime constraint,
-not something the package may work around with a sensor reset or forced TLS
-close.
+restart. The 06cb:00c9 driver now makes one GET_VERSION close attempt and
+requires a read-only TLS-status check before opening a new session. One
+approved experiment cleared the stale session without rebooting Linux and
+left the persistence snapshot unchanged. Windows Hello was checked after a
+later Windows Restart recovery cycle and still worked. Linux fingerprint login
+also succeeded after that Restart with the snapshot unchanged. This is one
+validated cycle on firmware `10.1.3399660`. If the bounded attempt fails, use a
+complete shutdown and roughly 30 seconds powered off. Do not reset the sensor
+or repeat the close attempt.
+
+The validated Ubuntu GDM setup uses five fingerprint tries in the dedicated
+`gdm-fingerprint` PAM service and skips the fingerprint module from
+`common-auth` in the `gdm-password` service, preventing two GDM workers from
+running separate fingerprint checks during GDM login. Password authentication
+remains available. These PAM
+changes are machine-specific and remain an explicit operator gate; the package
+does not edit PAM.
 
 PAM must retain the existing password authentication line. Adding fingerprint
 authentication must not make it `sufficient` in a way that bypasses password

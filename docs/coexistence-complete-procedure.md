@@ -326,6 +326,37 @@ In the dialog, keep **Unix authentication** selected and also select
 **Fingerprint authentication**. Never disable password authentication. Test in
 a separate terminal while the existing root-capable session remains open.
 
+On the validated Ubuntu setup, leave scan retries to the dedicated
+`gdm-fingerprint` PAM service. Its auth line is:
+
+```text
+auth required pam_fprintd.so max-tries=5 timeout=60
+```
+
+Before changing the GDM files, save them:
+
+```bash
+sudo cp -a /etc/pam.d/gdm-fingerprint \
+  /etc/pam.d/gdm-fingerprint.before-five-tries
+sudo cp -a /etc/pam.d/gdm-password \
+  /etc/pam.d/gdm-password.before-fingerprint-separation
+```
+
+The `gdm-password` service also includes `common-auth`, whose first auth module
+is the one-try fingerprint module. To keep it from competing for the sensor,
+place this immediately before `@include common-auth` in `/etc/pam.d/gdm-password`:
+
+```text
+auth [success=1 default=ignore] pam_succeed_if.so quiet service = gdm-password
+```
+
+This skips that first fingerprint module for `gdm-password`; Unix password
+authentication and the separate `gdm-fingerprint` worker remain available.
+Confirm `pam_fprintd.so` is still the first auth module in `common-auth` before
+using this one-module skip. A bad scan followed by a second touch was tested
+successfully. These local PAM edits are not installed by the coexistence
+package.
+
 ## 11. Exact service rollback
 
 If custom fprintd or PAM testing fails:
@@ -338,6 +369,11 @@ sudo systemctl daemon-reload
 sudo install -m 644 \
   /var/backups/synatlsmoc-coexist/common-auth.before-synatlsmoc \
   /etc/pam.d/common-auth
+sudo install -m 644 /etc/pam.d/gdm-fingerprint.before-five-tries \
+  /etc/pam.d/gdm-fingerprint
+sudo install -m 644 \
+  /etc/pam.d/gdm-password.before-fingerprint-separation \
+  /etc/pam.d/gdm-password
 systemctl is-enabled fprintd.service tudor-host-launcher.service
 ```
 
@@ -349,32 +385,44 @@ inactive. Do not reset or repair the sensor.
 Complete five alternating Windows/Linux cycles. In each OS, authenticate
 successfully. On every Linux cycle compare a fresh snapshot to the baseline.
 
-Use an orderly full shutdown, not Windows **Restart**, when switching from
-Windows to Linux. The tested Windows driver can leave its volatile TLS session
-active across a warm reboot. The Linux driver deliberately refuses to
-force-close or reset that session, so verification will be unavailable until
-the sensor loses power. The exact safe transition is:
+The tested Windows driver can leave its volatile TLS session active across a
+warm reboot. The 06cb:00c9 Linux driver now makes one GET_VERSION close
+attempt, then checks remote TLS before opening a new session. One approved
+Windows Restart recovery cycle succeeded with Linux fingerprint login, an
+unchanged persistence snapshot, and a subsequent successful Windows Hello
+check. If the bounded attempt fails, an orderly full shutdown remains the
+fallback. The established power-off transition is:
+
+An approved 2026-10-06 experiment found that one plaintext GET_VERSION while
+TLS was stale returned `0x0315` and cleared the volatile session without
+rebooting Linux. An approved USB reset did not clear TLS, and the internal root
+hub reports no port power switching. The subsequent read-only snapshots
+matched the baseline and Linux verification matched. After the default driver
+recovery was installed, a further Windows Restart was followed by successful
+Linux fingerprint login and Windows Hello, with the snapshot unchanged. This
+validates one cycle on firmware `10.1.3399660`; the full shutdown procedure
+remains the fallback if the one bounded close attempt fails.
 
 1. Close applications and run `shutdown.exe /s /t 0` in Windows PowerShell.
 2. Wait approximately 30 seconds after the machine powers off.
 3. Power on and boot Linux.
 
 Microsoft documents `shutdown.exe /s /t 0` as a full shutdown; the optional
-`/hybrid` switch requests Fast Startup instead. Do not use the Windows Restart
-menu item as a substitute for powering off. In the 2026-10-06 test on firmware
-`10.1.3399660`, Windows Restart led to a stale remote TLS refusal. After a
-subsequent full power-off and roughly 30 seconds off, the existing Linux claim
-returned `verify-match`; the post-match pre-authentication snapshot matched
-the baseline exactly. The experiment does not establish that every full
-shutdown removes sensor power or that every `0x05cb` capture response has the
-same cause. See the [Microsoft shutdown documentation](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/fast-startup-causes-system-hibernation-shutdown-fail).
+`/hybrid` switch requests Fast Startup instead. Use the shutdown fallback if
+the bounded close attempt fails. The 2026-10-06 test on firmware `10.1.3399660`
+first showed stale TLS after Restart; a full power-off and roughly 30 seconds
+off cleared it. The later default recovery also succeeded after Restart as
+described above. These tests do not establish that every full shutdown removes
+sensor power or that every `0x05cb` capture response has the same cause. See the
+[Microsoft shutdown documentation](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/fast-startup-causes-system-hibernation-shutdown-fail).
 
 For Linux to Windows, keep the custom no-timeout fprintd service under systemd
 control and use a normal orderly shutdown. Its tested stop path closes TLS.
 Never kill fprintd or remove `--no-timeout` before switching operating systems.
 
-If Linux reports `Sensor has a stale remote TLS session`, mask and stop fprintd,
-power off completely, wait 30 seconds, and boot Linux again:
+If Linux still reports `Sensor has a stale remote TLS session` after the single
+bounded close attempt, mask and stop fprintd, power off completely, wait 30
+seconds, and boot Linux again:
 
 ```bash
 sudo systemctl mask --now fprintd.service
@@ -389,8 +437,8 @@ authentication available during this recovery; restoring the fingerprint prompt
 does not by itself prove the stale session is gone.
 
 Stop immediately if Windows Hello fails, any snapshot field changes, or a
-power cycle does not clear the volatile session. Do not reset or force-close
-the sensor.
+power cycle does not clear the volatile session. Do not reset the sensor or
+repeat the one bounded GET_VERSION close attempt.
 
 ## 13. Private reinstall backup
 

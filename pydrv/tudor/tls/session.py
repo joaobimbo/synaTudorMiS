@@ -61,6 +61,8 @@ class TlsSession:
         self.established = False
         self.session_id = data.TlsSessionId.none
         self.remote_key = remote_key
+        self.record_layer = None
+        self.handshake_proto = None
 
     @_critical_method
     def establish(self):
@@ -90,8 +92,9 @@ class TlsSession:
             )
         assert self.handshake_proto.phase == TlsHandshakePhase.FINISHED
 
+        if not self.comm.remote_tls_status():
+            raise RuntimeError("sensor did not establish TLS")
         self.established = True
-        assert self.comm.remote_tls_status()
 
     @_critical_method
     def close(self):
@@ -108,6 +111,9 @@ class TlsSession:
                     )
                 )
             )
+
+        if self.comm.remote_tls_status():
+            raise RuntimeError("sensor still reports TLS after close-notify")
 
         # Reset layers
         self.record_layer = None

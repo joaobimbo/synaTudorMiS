@@ -20,8 +20,15 @@ TLS. After a full power-off and roughly 30 seconds off, the isolated fprintd
 verified the existing finger successfully; the post-match pre-authentication
 snapshot was byte-for-byte identical to the baseline. This demonstrates
 recovery for this cycle, not a general fix for the capture or reboot lifecycle.
-Do not reset, force-close TLS, re-pair, or change sensor persistence to work
-around these statuses.
+An approved later Windows Restart experiment showed that a single plaintext
+GET_VERSION returned `0x0315` and cleared the stale TLS session; a USB reset
+did not. Linux verification matched afterward and the persistence snapshot
+remained unchanged. The default bounded driver recovery was installed and
+validated after another Windows Restart: Linux fingerprint login succeeded,
+Windows Hello still worked, and the snapshot remained unchanged. The driver
+makes one close attempt and refuses if remote TLS remains active. Do not reset,
+repeat a forced close, re-pair, or change sensor persistence to work around
+these statuses.
 
 The following work remains before treating this as a generally installable
 solution.
@@ -40,9 +47,9 @@ solution.
 - Add automated lifecycle tests for daemon start/stop, cancellation, service
   restart, suspend/resume, warm reboot, cold boot, and alternating
   Windows/Linux boots.
-- Preserve the hard refusal when the sensor already reports remote TLS. Do not
-  add forced TLS close, USB reset, sensor reset, re-pairing, or automatic
-  recovery as a workaround.
+- Preserve the hard refusal if the single 06cb:00c9 GET_VERSION close attempt
+  does not clear remote TLS. Do not add USB/sensor reset, re-pairing, repeated
+  close attempts, or persistence writes as a workaround.
 
 ## Packaging and installation
 

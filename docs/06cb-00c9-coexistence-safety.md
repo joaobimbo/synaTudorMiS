@@ -10,8 +10,9 @@ the Tudor host launcher.
 | Classification | Commands / operations |
 |---|---|
 | Permanently denied | POKE, PROVISION, RESET_OWNERSHIP, storage format/write, DB object create, TAKE_OWNERSHIP, bootloader patch/DFT write, PAIR, enrollment (0x96), DB2 write/delete/cleanup/format, reset-SBL, firmware commands, unknown and extended commands |
-| Denied until proven | USB/sensor reset, forced TLS close, bootloader transitions, SSO |
-| Read-only | TLS-status control read, GET_VERSION, GET_START_INFO, PEEK, certificate/IOTA/storage reads, DB2 info/list/info/data, operation/hardware info |
+| Denied until proven | USB/sensor reset, repeated or unrestricted forced TLS close, bootloader transitions, SSO |
+| Read-only | TLS-status control read, GET_VERSION only when TLS is clear, GET_START_INFO, PEEK, certificate/IOTA/storage reads, DB2 info/list/info/data, operation/hardware info |
+| Bounded 06cb:00c9 runtime recovery | One GET_VERSION while a foreign TLS session is active; this can close the volatile session and must be followed by a TLS-status check |
 | Authenticated verify only | TLS data, event config/read, frame read/acquire/finish, image metrics, and identify-match restricted to exactly one template ID |
 
 The Python boundary in `tudor.safety` checks plaintext before TLS wrapping and
@@ -58,7 +59,9 @@ template selector or use a Windows SID for authorization.
 
 ## Hardware gates
 
-Every sensor-facing command must be displayed and explicitly approved first.
+Display and get explicit approval for every manual sensor-facing experiment.
+The installed driver's bounded GET_VERSION recovery is part of the approved
+default behavior for 06cb:00c9.
 Confirm Windows Hello before work and after each gate: read-only probe; stable
 snapshot; imported-pairing TLS/list; one wrong-finger test; one selected-template
 test; isolated libfprint; custom fprintd; PAM with password fallback; then five
@@ -66,9 +69,10 @@ alternating Windows/Linux boot cycles. Emit a terminal bell immediately before
 every requested touch. Only one layer owns retries.
 
 Stop immediately on any snapshot change, identity mismatch, pairing failure,
-unclassified command requirement, bootloader/stale TLS state, or Windows Hello
-failure. Do not reset, recover, clear, repair, re-pair, or use BIOS recovery
-automatically. A failed reuse attempt is a safe refusal, not permission to pair.
+unclassified command requirement, bootloader state, stale TLS after the single
+bounded close attempt, or Windows Hello failure. Do not reset, clear, repair,
+re-pair, or use BIOS recovery automatically. A failed reuse attempt is a safe
+refusal, not permission to pair.
 
 The first two standalone gates are implemented but must not be run without
 separate approval of the exact command:
@@ -82,6 +86,25 @@ Neither command configures or resets USB, detaches a kernel driver, starts TLS,
 or performs recovery. Both refuse an active remote TLS session, bootloader mode,
 active kernel ownership, missing USB serial, malformed responses, and any
 command outside the read-only policy.
+
+On one approved 06cb:00c9 Windows Restart experiment, a USB reset left remote
+TLS active. One separately approved plaintext GET_VERSION returned `0x0315` and
+cleared it. The pre-authentication snapshot matched the saved baseline and
+Linux verification matched. After installing the default driver path, another
+Windows Restart was followed by successful Linux fingerprint login and a
+successful Windows Hello check; the snapshot remained unchanged. This is one
+validated recovery cycle, not proof across all devices or firmware. GET_VERSION
+is **not** read-only while foreign TLS is active. The C driver performs at most
+one GET_VERSION close attempt for `06cb:00c9`, checks remote TLS status
+afterward, and retains the hard refusal if TLS remains active. This closes a
+volatile TLS session; it does not reset the sensor or guarantee a power cycle.
+
+The tested Ubuntu PAM setup gives scan retries to the dedicated
+`gdm-fingerprint` service (`max-tries=5 timeout=60`) and makes the
+`gdm-password` service skip the fingerprint module included by `common-auth`.
+The password modules remain active. A failed scan followed by a second touch
+logged in successfully. PAM syntax is machine-specific and is not installed by
+the coexistence package.
 
 The later authenticated commands are `tudor-safe list BUNDLE --sensor-key KEY`
 and `tudor-safe verify BUNDLE TEMPLATE_SHA256 --sensor-key KEY`. Both compare

@@ -236,9 +236,11 @@ def list_templates(bundle_path: str, sensor_key_path: str) -> list[dict[str, obj
         before.assert_unchanged(snapshot_transport(comm, observed))
         return result
     finally:
-        if sensor.initialized:
-            sensor.uninitialize()
-        comm.close()
+        try:
+            if sensor.initialized:
+                sensor.uninitialize()
+        finally:
+            comm.close()
 
 
 def sanitize_template_list(enrollments) -> list[dict[str, object]]:
@@ -309,9 +311,11 @@ def verify_template(bundle_path: str, sensor_key_path: str,
         before.assert_unchanged(snapshot_transport(comm, observed))
         return matched
     finally:
-        if sensor.initialized:
-            sensor.uninitialize()
-        comm.close()
+        try:
+            if sensor.initialized:
+                sensor.uninitialize()
+        finally:
+            comm.close()
 
 
 def claim_existing(bundle_path: str, sensor_key_path: str, template_sha256: str,
@@ -346,9 +350,11 @@ def claim_existing(bundle_path: str, sensor_key_path: str, template_sha256: str,
             sensor.get_enrollment_cache(), template_sha256)
         before.assert_unchanged(snapshot_transport(comm, observed))
     finally:
-        if sensor.initialized:
-            sensor.uninitialize()
-        comm.close()
+        try:
+            if sensor.initialized:
+                sensor.uninitialize()
+        finally:
+            comm.close()
     if not isinstance(subtype, (bytes, bytearray)) or len(subtype) != 1:
         raise RuntimeError("sensor returned an invalid finger subtype")
     reference = TemplateRefV1(selected.hex(), finger, subtype[0])
